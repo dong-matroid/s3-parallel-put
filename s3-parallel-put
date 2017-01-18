@@ -41,6 +41,7 @@ import tarfile
 import time
 import magic #python-magic
 import mimetypes
+import traceback
 
 import boto
 from boto.s3.connection import S3Connection
@@ -88,7 +89,7 @@ class FileObjectCache(object):
 
 class Value(object):
 
-    def __init__(self, file_object_cache, content=None, filename=None, md5=None, offset=None, path=None, size=None, bucket_name=None):
+    def __init__(self, file_object_cache, content=None, filename=None, md5=None, offset=None, path=None, size=None, bucket_name=None, s3_bucket = None):
         self.file_object_cache = file_object_cache
         self.content = content
         self.filename = filename
@@ -97,6 +98,7 @@ class Value(object):
         self.path = path
         self.size = size
         self.bucket_name = bucket_name
+        self.s3_bucket = s3_bucket
 
     def get_content(self):
         if self.content is None:
@@ -201,6 +203,35 @@ def walk_s3(source, options):
                 size=key.size,
                 path='%s/%s' % (source, key.name)))
 
+def walk_s3_list(source, options):
+  """source is a file where each line is a s3 object"""
+  connection = S3Connection(host=options.host, is_secure=options.secure)
+  regex = 's3:\/\/([^/]*)\/(.*)$';
+  m = re.match(regex, source)
+  if m is None:
+    print('bad url', source)
+    return
+
+  bucket = m.group(1)
+  source_path = m.group(2)
+  s3_bucket = connection.get_bucket(bucket)
+  key = s3_bucket.get_key(source_path)
+  list_file = '/tmp/urls.txt'
+  key.get_contents_to_filename(list_file)
+
+  with open(list_file, 'r') as s3_list_file:
+    lines = s3_list_file.read().splitlines()
+    for line in lines:
+      if excluded(line, options):
+        continue
+
+      yield (
+            line,
+            dict(
+                bucket_name=bucket, # assuming copy within same bucket
+                path=line,
+                size = -1,
+                s3_bucket = s3_bucket))
 
 def walker(walk, put_queue, sources, options):
     logger = logging.getLogger('%s[walker-%d]' % (os.path.basename(sys.argv[0]), current_process().pid))
@@ -278,9 +309,15 @@ def putter(put, put_queue, stat_queue, options):
                 connection = S3Connection(is_secure=options.secure, host=options.host)
             if bucket is None:
                 bucket = connection.get_bucket(options.bucket)
-            key = put(bucket, key_name, value)
-            if key:
+            if value.s3_bucket is not None and value.s3_bucket.name != options.bucket: # copy between two buckets
+              src_key = value.s3_bucket.get_key(value.path)
+              src_key.copy(bucket, value.path)
+              stat_queue.put(dict(size=value.get_size()))
+            else:
+              key = put(bucket, key_name, value)
+              if key:
                 if value.should_copy_content():
+                    logger.error('should copy', bucket, key_name, value)
                     if options.headers:
                         headers = dict(tuple(header.split(':', 1)) for header in options.headers)
                     else:
@@ -316,14 +353,15 @@ def putter(put, put_queue, stat_queue, options):
                 logger.info('%s %s> %s' % (
                     value.path, 'z' if should_gzip else '-', key.name))
                 stat_queue.put(dict(size=value.get_size()))
-            else:
+              else:
                 logger.info('skipping %s -> %s' % (value.path, key_name))
         except SSLError as exc:
             logger.error('%s -> %s (%s)' % (value.path, key_name, exc))
             put_queue.put(args)
             connection, bucket = None, None
-        except IOError as exc:
+        except Exception as exc:
             logger.error('%s -> %s (%s)' % (value.path, key_name, exc))
+            traceback.print_exc()
         put_queue.task_done()
 
 
@@ -357,11 +395,11 @@ def main(argv):
             help='use secure connection')
     parser.add_option_group(group)
     group = OptionGroup(parser, 'Source options')
-    group.add_option('--walk', choices=('filesystem', 'tar', 's3'), default='filesystem', metavar='MODE',
+    group.add_option('--walk', choices=('filesystem', 'tar', 's3', 's3_list'), default='filesystem', metavar='MODE',
             help='set walk mode (filesystem or tar)')
-    group.add_option('--exclude', action='append', default=[], metavar='PATTERN', 
+    group.add_option('--exclude', action='append', default=[], metavar='PATTERN',
             help='exclude files matching PATTERN')
-    group.add_option('--include', action='append', default=[], metavar='PATTERN', 
+    group.add_option('--include', action='append', default=[], metavar='PATTERN',
             help='don\'t exclude files matching PATTERN')
     parser.add_option_group(group)
     group = OptionGroup(parser, 'Put options')
@@ -428,7 +466,7 @@ def main(argv):
     start = time.time()
     put_queue = JoinableQueue(1024 * options.processes)
     stat_queue = JoinableQueue()
-    walk = {'filesystem': walk_filesystem, 'tar': walk_tar, 's3': walk_s3}[options.walk]
+    walk = {'filesystem': walk_filesystem, 'tar': walk_tar, 's3': walk_s3, 's3_list': walk_s3_list}[options.walk]
     walker_process = Process(target=walker, args=(walk, put_queue, args, options))
     walker_process.start()
     put = {'add': put_add, 'stupid': put_stupid, 'update': put_update, 'copy': put_copy}[options.put]
